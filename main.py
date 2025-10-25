@@ -8,22 +8,43 @@ import pytesseract
 import pandas as pd
 
 from fastapi import FastAPI, UploadFile, File, Response, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
-# ---------- Config ----------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY env var")
-client = OpenAI(api_key=OPENAI_API_KEY)
-
+# -----------------------------------------------------------------------------
+# App setup
+# -----------------------------------------------------------------------------
 app = FastAPI(title="Extractor Estado de Resultados → Excel")
+
+# Serve the tiny front end from / (static/index.html)
+# If you later host UI on GitHub Pages, you can remove this and use only the API.
 app.mount("/",
           StaticFiles(directory="static", html=True),
           name="static")
 
+# (Optional) CORS — set a specific origin list if your UI is on another domain
+ALLOW_ORIGINS = os.getenv("ALLOW_ORIGINS", "*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in ALLOW_ORIGINS.split(",")] if ALLOW_ORIGINS else ["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------------------------------------------------------
+# OpenAI client (lazy)
+# -----------------------------------------------------------------------------
+def get_client() -> OpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY not set")
+    return OpenAI(api_key=key)
+
+# -----------------------------------------------------------------------------
+# Detection config + JSON schema for structured output
+# -----------------------------------------------------------------------------
 TARGET_TOKENS = [
     "estado de resultados",
     "estado de resultados integrales",
@@ -31,7 +52,6 @@ TARGET_TOKENS = [
     "estado de resultados por naturaleza",
 ]
 
-# JSON Schema for Structured Outputs (fields in Spanish)
 JSON_SCHEMA = {
     "name": "EstadoResultados",
     "strict": True,
@@ -46,9 +66,9 @@ JSON_SCHEMA = {
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "etiqueta_periodo": {"type": "string"},   # p.ej. "31-12-2024"
-                        "moneda": {"type": "string"},             # p.ej. "CLP", "USD"
-                        "unidad": {"type": "string"},             # p.ej. "miles", "millones"
+                        "etiqueta_periodo": {"type": "string"},   # ej. "31-12-2024"
+                        "moneda": {"type": "string"},             # ej. CLP / USD / UF
+                        "unidad": {"type": "string"},             # ej. miles / millones
                         "ingresos": {"type": "number"},
                         "costo_de_ventas": {"type": "number"},
                         "utilidad_bruta": {"type": "number"},
@@ -76,18 +96,21 @@ Eres un analista contable. A partir del texto suministrado (páginas del PDF) ex
 
 Reglas:
 - Devuelve números en formato numérico (no en texto), y normaliza todos según la unidad detectada
-  (p.ej., si el estado dice “en millones de CLP”, convierte a millones).
+  (p.ej., si el estado dice “en millones de CLP”, conserva millones en CLP).
 - Si algún rubro no aparece explícito, puedes inferirlo cuando sea trivial
   (p.ej., utilidad bruta = ingresos - costo de ventas). Si no es posible, omítelo.
 - Usa etiquetas de periodo tal como aparezcan (ej.: “31-12-2024”, “12M 2024”).
 - Moneda y unidad deben venir de los encabezados (CLP, UF, USD; miles/millones).
 - Si hay estados por naturaleza vs función, prioriza la versión con mayor detalle.
-- No inventes, no cambies de moneda, no conviertas UF↔CLP: solo reporta lo que esté en el documento.
+- No inventes, no conviertas UF↔CLP: reporta lo que esté en el documento.
 - Salida EXACTAMENTE conforme al esquema JSON que te doy.
 """
 
+# -----------------------------------------------------------------------------
+# PDF helpers
+# -----------------------------------------------------------------------------
 def find_candidate_pages(pdf_bytes: bytes) -> list[int]:
-    """Quick text scan to locate pages with target keywords."""
+    """Quick scan by text to locate pages with target keywords."""
     pages = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages):
@@ -97,8 +120,9 @@ def find_candidate_pages(pdf_bytes: bytes) -> list[int]:
                 text = ""
             if any(tok in text for tok in TARGET_TOKENS):
                 pages.append(i)
-    # fallback: if nothing found, scan all (but cap at first 6 to be safe)
-    return pages if pages else list(range(0, min(6, len(pdf.pages))))
+        if not pages:
+            pages = list(range(0, min(6, len(pdf.pages))))  # fallback
+    return pages
 
 def page_to_text(pdf_bytes: bytes, page_num: int) -> str:
     """Extract text; if empty (scan), OCR via Tesseract."""
@@ -117,10 +141,7 @@ def page_to_text(pdf_bytes: bytes, page_num: int) -> str:
     page = doc.load_page(page_num)
     pix = page.get_pixmap(dpi=300)
     img_bytes = pix.tobytes("png")
-    ocr = pytesseract.image_to_string(
-        io.BytesIO(img_bytes),
-        lang="spa+eng"
-    )
+    ocr = pytesseract.image_to_string(io.BytesIO(img_bytes), lang="spa+eng")
     return ocr or ""
 
 def extract_text_block(pdf_bytes: bytes) -> str:
@@ -132,39 +153,33 @@ def extract_text_block(pdf_bytes: bytes) -> str:
             blocks.append(f"--- Página {p+1} ---\n{t}")
     return "\n\n".join(blocks)
 
+# -----------------------------------------------------------------------------
+# OpenAI call + Excel builder
+# -----------------------------------------------------------------------------
 def call_openai_structured(extracted_text: str) -> dict:
-    """
-    Use OpenAI with Structured Outputs (JSON Schema) to normalize the Income Statement.
-    We use chat.completions for wide compatibility with SDKs.
-    Docs: Structured Outputs & API reference.
-    """
-    # IMPORTANT: model name—pick a fast vision-capable or text-only (we already OCRed)
-    model = "gpt-4o-mini"  # good cost/quality tradeoff
-
+    """Use OpenAI structured outputs (JSON Schema) to normalize Income Statement."""
+    client = get_client()
     resp = client.chat.completions.create(
-        model=model,
+        model="gpt-4o-mini",  # good cost/quality tradeoff
         messages=[
             {"role": "system", "content": PROMPT_INSTRUCTIONS.strip()},
-            {"role": "user", "content": extracted_text[:200000]}  # safety cap
+            {"role": "user", "content": extracted_text[:200000]},  # safety cap
         ],
-        response_format={ "type": "json_schema", "json_schema": JSON_SCHEMA }
+        response_format={"type": "json_schema", "json_schema": JSON_SCHEMA},
     )
     raw = resp.choices[0].message.content
-    # Some SDKs return JSON directly; others return string—parse both cases:
     if isinstance(raw, str):
         try:
             return json.loads(raw)
         except Exception:
-            # strip code fences if any
             cleaned = re.sub(r"^```json|```$", "", raw.strip(), flags=re.MULTILINE)
             return json.loads(cleaned)
     return raw
 
 def to_excel_bytes(payload: dict, raw_text: str) -> bytes:
-    # Flatten 'periodos'
     rows = []
     for p in payload.get("periodos", []):
-        row = {
+        rows.append({
             "etiqueta_periodo": p.get("etiqueta_periodo"),
             "moneda": p.get("moneda"),
             "unidad": p.get("unidad"),
@@ -179,22 +194,27 @@ def to_excel_bytes(payload: dict, raw_text: str) -> bytes:
             "utilidad_neta": p.get("utilidad_neta"),
             "ebitda": p.get("ebitda"),
             "depreciacion_amortizacion": p.get("depreciacion_amortizacion"),
-        }
-        rows.append(row)
+        })
     df = pd.DataFrame(rows)
 
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Estado_Resultados")
-        # Metadata
         meta = {
             "empresa": [payload.get("empresa")],
             "observaciones_modelo": [payload.get("observaciones")],
-            "paginas_capturadas": [raw_text[:5000]],  # include first chunk for traceability
+            "primer_bloque_texto": [raw_text[:5000]],
         }
         pd.DataFrame(meta).to_excel(writer, index=False, sheet_name="Metadata")
     out.seek(0)
     return out.read()
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.get("/health", response_class=HTMLResponse)
+def health():
+    return "ok"
 
 @app.post("/api/extract")
 async def extract_endpoint(file: UploadFile = File(...)):
@@ -202,17 +222,21 @@ async def extract_endpoint(file: UploadFile = File(...)):
         raise HTTPException(400, "Debe subir un PDF.")
     pdf_bytes = await file.read()
     if len(pdf_bytes) > 40 * 1024 * 1024:
-        raise HTTPException(400, "PDF demasiado grande (máx. ~40MB demo).")
+        raise HTTPException(400, "PDF demasiado grande para la demo (~40MB).")
 
     text_block = extract_text_block(pdf_bytes)
     if not text_block.strip():
-        raise HTTPException(422, "No pude extraer texto u OCR del PDF.")
+        raise HTTPException(422, "No pude extraer texto ni OCR del PDF.")
 
-    result = call_openai_structured(text_block)
+    try:
+        result = call_openai_structured(text_block)
+    except Exception as e:
+        raise HTTPException(502, f"Error al llamar al modelo: {e}")
+
     excel = to_excel_bytes(result, text_block)
-
-    headers = {
-        "Content-Disposition": 'attachment; filename="estado_resultados.xlsx"'
-    }
-    return Response(content=excel, headers=headers,
-                    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    headers = {"Content-Disposition": 'attachment; filename="estado_resultados.xlsx"'}
+    return Response(
+        content=excel,
+        headers=headers,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
