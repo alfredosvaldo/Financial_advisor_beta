@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Extractor Estado de Resultados → Excel</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 2rem; }
+    .card { max-width: 520px; padding: 1.25rem; border: 1px solid #ddd; border-radius: 12px; }
+    button { padding: .6rem 1rem; border-radius: 8px; border: 1px solid #999; background: #111; color: #fff; cursor: pointer; }
+    button[disabled] { opacity: .5; cursor: not-allowed;}
+    .muted { color: #666; font-size: .9rem; }
+    .row { margin-top: 1rem; }
+    #status { margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Sube tu PDF (Estados Financieros)</h2>
+    <p class="muted">Extrae “Estado de Resultados” / “Estado de Resultados Integrales” y descarga Excel.</p>
+    <form id="form">
+      <div class="row">
+        <input type="file" id="pdf" name="file" accept="application/pdf" required />
+      </div>
+      <div class="row">
+        <button id="go" type="submit">Procesar</button>
+      </div>
+    </form>
+    <div id="status" class="muted"></div>
+    <div id="download"></div>
+  </div>
+
+  <script>
+    const form = document.getElementById('form');
+    const status = document.getElementById('status');
+    const dl = document.getElementById('download');
+    const btn = document.getElementById('go');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      dl.innerHTML = "";
+      status.textContent = "Procesando…";
+      btn.disabled = true;
+
+      const fd = new FormData();
+      fd.append('file', document.getElementById('pdf').files[0]);
+
+      try {
+        const res = await fetch('/api/extract', { method: 'POST', body: fd });
+        if (!res.ok) throw new Error(await res.text());
+        // Receive as blob (Excel)
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'estado_resultados.xlsx';
+        a.textContent = 'Descargar Excel';
+        dl.appendChild(a);
+        status.textContent = "Listo ✅";
+      } catch (err) {
+        status.textContent = "Error: " + (err.message || err);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
